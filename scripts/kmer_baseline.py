@@ -1,33 +1,28 @@
 """
 K-mer frequency baseline for DGEB retrieval tasks.
 
-NOTE on qrels structure (discovered in step1):
+NOTE on qrels structure:
   The Arch Retrieval qrels have 163,612 rows across 2,343 queries,
   meaning ~69.83 relevant corpus entries per query on average.
   Relevance label is 1 (fuzz_ratio > 90 during dataset construction),
   stored as fuzz_ratio=1 in the HuggingFace dataset.
   pytrec_eval treats any score > 0 as relevant, so MAP@5 measures
   whether any of the ~70 relevant bacterial proteins appear in the
-  top-5 retrieved results. This is a retrieval-with-many-positives
-  regime, not a needle-in-a-haystack regime.
+  top-5 retrieved results.
 
-We implement a KmerModel whose encode() method returns k-mer frequency vectors
-with exactly the same shape contract as BioSeqTransformer.encode():
-    output shape: [n_sequences, n_layers, embed_dim]
-        n_layers = 1   (k-mer has no layer concept; one representation per k)
-        embed_dim = 20^k  (number of possible k-mers over standard amino acids)
+We implement k-mer frequency vectors and evaluate k in {1, 2, 3, 4, 5}.
 
-We feed these vectors directly into DGEB's RetrievalEvaluator, which
-computes MAP@5 identically to the foundation model evaluation.
-
-We evaluate k in {1, 2, 3, 4} on both Arch and Euk retrieval tasks.
+MEMORY STRATEGY:
+  k <= 4: vocab size <= 160,000 → dense float32 matrix, pass to RetrievalEvaluator.
+  k >= 5: vocab size >= 3,200,000 → scipy sparse CSR matrix to avoid OOM.
+          Cosine similarity computed as sparse @ sparse.T, then pytrec_eval
+          called directly (same backend RetrievalEvaluator uses internally).
 
 Outputs:
     results/kmer_k{k}/arch_retrieval.json
     results/kmer_k{k}/euk_retrieval.json
     kmer_results_summary.json
 """
-
 
 import itertools
 import json
@@ -37,119 +32,213 @@ from typing import List
 
 import datasets
 import numpy as np
-from scipy.sparse import csr_matrix
+import pytrec_eval
+from scipy import sparse
 from sklearn.preprocessing import normalize
+
 from dgeb.evaluators import RetrievalEvaluator
 
-# Standard 20 amino acids. Non-standard characters (B, Z, X, U, O) are ignored.
 STANDARD_AA = "ACDEFGHIKLMNPQRSTVWY"
 
+# Use dense encoding + RetrievalEvaluator for k <= this value.
+# For k above this, use sparse encoding + direct pytrec_eval.
+# k=4 dense costs ~740MB RAM; k=5 dense costs ~118GB — must be sparse.
+DENSE_K_MAX = 4
+
 # ─────────────────────────────────────────────────────────────────────────────
-# K-MER ENCODING
+# K-MER VOCABULARY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_kmer_index(k: int) -> dict:
-    """
-    Build a mapping from every k-mer string to an integer index.
-
-    The vocabulary is all 20^k combinations of standard amino acids,
-    in lexicographic order. Non-standard characters are ignored during
-    encoding (the k-mer containing them is simply skipped).
-
-    Returns:
-        dict: {kmer_string -> int_index}, length = 20^k
-    """
+    """Map every standard amino acid k-mer to an integer column index."""
     all_kmers = ["".join(p) for p in itertools.product(STANDARD_AA, repeat=k)]
     return {kmer: idx for idx, kmer in enumerate(all_kmers)}
 
 
-def encode_sequence(seq: str, kmer_index: dict, k: int) -> np.ndarray:
-    """
-    Encode a single amino acid sequence as a normalized k-mer frequency vector.
+# ─────────────────────────────────────────────────────────────────────────────
+# DENSE ENCODING  (k <= DENSE_K_MAX)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Algorithm:
-        1. Slide a window of width k across the sequence.
-        2. Count each k-mer that contains only standard amino acids.
-        3. Divide counts by total number of valid k-mers (L2-normalize
-           is NOT applied here; we use L2 normalization across all
-           sequences together after stacking, because sklearn's
-           cosine_similarity handles un-normalized vectors correctly,
-           but the RetrievalEvaluator uses cos_sim which normalizes
-           internally via F.normalize — so raw counts are fine).
-
-    Args:
-        seq:        Amino acid string (arbitrary case).
-        kmer_index: Output of build_kmer_index(k).
-        k:          K-mer length.
-
-    Returns:
-        np.ndarray of shape (20^k,), dtype float32.
-    """
+def _encode_one_dense(seq: str, kmer_index: dict, k: int) -> np.ndarray:
+    """Return a normalized frequency vector (dense float32) for one sequence."""
     vocab_size = len(kmer_index)
     counts = np.zeros(vocab_size, dtype=np.float32)
-
     seq = seq.upper()
     n_valid = 0
     for i in range(len(seq) - k + 1):
-        kmer = seq[i : i + k]
-        idx  = kmer_index.get(kmer)   # None if any non-standard character
+        kmer = seq[i: i + k]
+        idx = kmer_index.get(kmer)
         if idx is not None:
             counts[idx] += 1
             n_valid += 1
-
     if n_valid > 0:
-        counts /= n_valid   # normalize to frequencies (sum to 1)
-    # If n_valid == 0 (sequence has no valid k-mers), return zero vector.
-    # This should not happen for standard protein sequences.
+        counts /= n_valid
     return counts
 
 
-def encode_sequences(sequences: List[str], k: int) -> np.ndarray:
+def encode_dense(sequences: List[str], k: int) -> np.ndarray:
     """
-    Encode a list of sequences and return an array compatible with
-    BioSeqTransformer.encode() output shape.
-
-    Args:
-        sequences: List of amino acid strings.
-        k:         K-mer length.
-
-    Returns:
-        np.ndarray of shape [n_sequences, 1, 20^k]
-            - axis 0: sequences
-            - axis 1: "layers" (always 1 for k-mer model)
-            - axis 2: embedding dimensions (20^k k-mer frequencies)
+    Encode sequences as a dense float32 matrix, shape [n_seq, 1, 20^k].
+    The middle axis (size 1) is the 'layers' axis expected by RetrievalEvaluator.
     """
     kmer_index = build_kmer_index(k)
-    vocab_size = len(kmer_index)   # 20^k
-
-    print(f"  Encoding {len(sequences):,} sequences with k={k} "
-          f"(vocab size = {vocab_size:,})...")
+    vocab_size = len(kmer_index)
+    print(f"  Dense encoding {len(sequences):,} sequences, k={k} "
+          f"(vocab={vocab_size:,}, "
+          f"~{len(sequences) * vocab_size * 4 / 1e6:.0f} MB)...")
     matrix = np.zeros((len(sequences), vocab_size), dtype=np.float32)
     for i, seq in enumerate(sequences):
-        matrix[i] = encode_sequence(seq, kmer_index, k)
-        if (i + 1) % 1000 == 0:
+        matrix[i] = _encode_one_dense(seq, kmer_index, k)
+        if (i + 1) % 2000 == 0:
             print(f"    {i+1:,}/{len(sequences):,}", end="\r")
     print(f"    {len(sequences):,}/{len(sequences):,} done.     ")
-
-    # Shape: [n_sequences, 1, vocab_size]
-    # axis 1 = "layers" — DGEB evaluator indexes corpus_embeds[:, i]
-    return matrix[:, np.newaxis, :]
+    return matrix[:, np.newaxis, :]   # [n_seq, 1, vocab_size]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA LOADING (mirrors retrieval_tasks.py exactly)
+# SPARSE ENCODING  (k >= 5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _encode_one_sparse(seq: str, kmer_index: dict, k: int, vocab_size: int):
+    """
+    Return (col_indices, values) for one sequence's sparse row.
+    Values are normalized k-mer frequencies.
+    """
+    counts = {}
+    seq = seq.upper()
+    n_valid = 0
+    for i in range(len(seq) - k + 1):
+        kmer = seq[i: i + k]
+        idx = kmer_index.get(kmer)
+        if idx is not None:
+            counts[idx] = counts.get(idx, 0) + 1
+            n_valid += 1
+    if n_valid == 0:
+        return [], []
+    cols = list(counts.keys())
+    vals = [v / n_valid for v in counts.values()]
+    return cols, vals
+
+
+def encode_sparse(sequences: List[str], k: int) -> sparse.csr_matrix:
+    """
+    Encode sequences as a L2-normalized sparse CSR matrix, shape [n_seq, 20^k].
+    Memory cost: O(n_seq * avg_seq_len) — independent of vocab_size.
+
+    Returns a scipy CSR matrix where each row has unit L2 norm,
+    ready for cosine similarity via matrix multiplication.
+    """
+    kmer_index = build_kmer_index(k)
+    vocab_size = len(kmer_index)
+    n = len(sequences)
+
+    # Build COO data for the CSR matrix
+    row_ptrs = [0]
+    col_indices = []
+    data = []
+
+    print(f"  Sparse encoding {n:,} sequences, k={k} "
+          f"(vocab={vocab_size:,}, "
+          f"~{n * (350 - k + 1) * 8 / 1e6:.0f} MB estimate)...")
+
+    for i, seq in enumerate(sequences):
+        cols, vals = _encode_one_sparse(seq, kmer_index, k, vocab_size)
+        col_indices.extend(cols)
+        data.extend(vals)
+        row_ptrs.append(len(col_indices))
+        if (i + 1) % 2000 == 0:
+            print(f"    {i+1:,}/{n:,}", end="\r")
+    print(f"    {n:,}/{n:,} done.     ")
+
+    # Build CSR
+    row_ind = np.array(
+        [r for r, (start, end) in enumerate(zip(row_ptrs, row_ptrs[1:]))
+         for _ in range(end - start)],
+        dtype=np.int32,
+    )
+    mat = sparse.csr_matrix(
+        (np.array(data, dtype=np.float32),
+         (row_ind, np.array(col_indices, dtype=np.int32))),
+        shape=(n, vocab_size),
+    )
+
+    # L2-normalize each row so dot product = cosine similarity
+    mat = normalize(mat, norm="l2", copy=False)
+    return mat
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PYTREC_EVAL WRAPPER  (used by sparse path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_with_pytrec(
+    sim_matrix: np.ndarray,       # [n_queries, n_corpus]
+    query_ids: List[str],
+    corpus_ids: List[str],
+    qrels: dict,
+    k_values: List[int] = [5, 10, 50],
+) -> dict:
+    """
+    Compute retrieval metrics using pytrec_eval directly.
+    This is the same backend used inside RetrievalEvaluator.
+
+    Args:
+        sim_matrix : cosine similarity scores, shape [n_queries, n_corpus]
+        query_ids  : string IDs for each row of sim_matrix
+        corpus_ids : string IDs for each column of sim_matrix
+        qrels      : {query_id: {corpus_id: relevance}}
+        k_values   : cutoffs for @k metrics
+
+    Returns:
+        dict of metric_name → mean value across queries (same format as
+        RetrievalEvaluator output, so step4 load_map5 works unchanged).
+    """
+    # Build pytrec_eval run: {query_id: {corpus_id: score}}
+    run = {}
+    for qi, qid in enumerate(query_ids):
+        if qid not in qrels:
+            continue
+        run[qid] = {corpus_ids[ci]: float(sim_matrix[qi, ci])
+                    for ci in range(len(corpus_ids))}
+
+    # Measures to compute
+    measures = set()
+    for k in k_values:
+        measures.update([f"map_cut_{k}", f"ndcg_cut_{k}",
+                         f"recall_{k}", f"P_{k}"])
+
+    evaluator = pytrec_eval.RelevanceEvaluator(qrels, measures)
+    per_query  = evaluator.evaluate(run)
+
+    # Average across queries and rename to DGEB convention
+    # pytrec_eval uses "map_cut_5"; DGEB uses "map_at_5"
+    rename = lambda m: m.replace("map_cut_", "map_at_") \
+                        .replace("ndcg_cut_", "ndcg_at_") \
+                        .replace("recall_", "recall_at_") \
+                        .replace("P_", "precision_at_")
+
+    results = {}
+    if not per_query:
+        return results
+    for measure in next(iter(per_query.values())).keys():
+        vals = [per_query[qid][measure] for qid in per_query]
+        results[rename(measure)] = round(float(np.mean(vals)), 5)
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
 TASK_CONFIGS = {
     "arch_retrieval": {
-        "display_name" : "Arch Retrieval",
         "seq_dataset"  : "tattabio/arch_retrieval",
         "seq_revision" : "a19124322604a21b26b1b3c13a1bd0b8a63c9f7b",
         "qrel_dataset" : "tattabio/arch_retrieval_qrels",
         "qrel_revision": "3f142f2f9a0995d56c6e77188c7251761450afcf",
     },
     "euk_retrieval": {
-        "display_name" : "Euk Retrieval",
         "seq_dataset"  : "tattabio/euk_retrieval",
         "seq_revision" : "c93dc56665cedd19fbeaea9ace146f2474c895f0",
         "qrel_dataset" : "tattabio/euk_retrieval_qrels",
@@ -159,90 +248,83 @@ TASK_CONFIGS = {
 
 
 def load_task_data(task_id: str):
-    """
-    Load corpus, queries, and qrels for a retrieval task.
-    Returns corpus_ds, query_ds, qrels_dict — same format used by
-    DGEB's run_retrieval_task().
-    """
     cfg = TASK_CONFIGS[task_id]
     print(f"  Loading sequences: {cfg['seq_dataset']}")
     seq_ds   = datasets.load_dataset(cfg["seq_dataset"],  revision=cfg["seq_revision"])
     print(f"  Loading qrels    : {cfg['qrel_dataset']}")
     qrels_ds = datasets.load_dataset(cfg["qrel_dataset"], revision=cfg["qrel_revision"])
-
-    # retrieval_tasks.py uses train=corpus, test=queries
     corpus_ds = seq_ds["train"]
     query_ds  = seq_ds["test"]
-
-    # Build qrels dict: {query_id: {corpus_id: relevance_score}}
-    # Relevance score = fuzz_ratio (>90 means relevant per DGEB Appendix A)
     qrels_dict = defaultdict(dict)
     for row in qrels_ds["train"]:
         qrels_dict[str(row["query_id"])][str(row["corpus_id"])] = int(row["fuzz_ratio"])
-
-    print(f"  Corpus : {len(corpus_ds):,} sequences")
-    print(f"  Queries: {len(query_ds):,} sequences")
-    print(f"  Qrels  : {len(qrels_dict):,} unique queries with relevance labels")
+    print(f"  Corpus : {len(corpus_ds):,} | Queries: {len(query_ds):,} | "
+          f"Qrels: {len(qrels_dict):,} queries")
     return corpus_ds, query_ds, qrels_dict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RETRIEVAL EVALUATION
+# RETRIEVAL EVALUATION (dispatches dense vs sparse based on k)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_kmer_retrieval(task_id: str, k: int) -> dict:
-    """
-    Run k-mer retrieval on one task and return the metrics dict.
-
-    This mirrors the logic of DGEB's run_retrieval_task() but replaces
-    model.encode() with our k-mer encode_sequences().
-
-    The RetrievalEvaluator expects:
-        corpus_embeds : np.ndarray of shape [n_corpus, embed_dim]
-        query_embeds  : np.ndarray of shape [n_queries, embed_dim]
-        corpus_ids    : list of string IDs
-        query_ids     : list of string IDs
-        qrels         : {query_id: {corpus_id: relevance_score}}
-
-    It computes cosine similarity internally (eval_utils.cos_sim uses
-    F.normalize then matrix multiplication), so our un-normalized
-    frequency vectors are handled correctly.
-    """
     print(f"\nTask: {task_id}, k={k}")
     corpus_ds, query_ds, qrels_dict = load_task_data(task_id)
 
-    # Encode: output shape [n_sequences, 1, 20^k]
-    print("Encoding corpus...")
-    corpus_embeds = encode_sequences(corpus_ds["Sequence"], k)  # [n_corpus, 1, vocab]
-    print("Encoding queries...")
-    query_embeds  = encode_sequences(query_ds["Sequence"],  k)  # [n_query, 1, vocab]
+    if k <= DENSE_K_MAX:
+        # ── Dense path: delegate entirely to RetrievalEvaluator ──────────────
+        print("Encoding corpus...")
+        corpus_embeds = encode_dense(corpus_ds["Sequence"], k)
+        print("Encoding queries...")
+        query_embeds  = encode_dense(query_ds["Sequence"],  k)
 
-    # Layer index 0 = our single "layer"
-    # corpus_embeds[:, 0] has shape [n_corpus, vocab_size]
-    layer_idx = 0
-    evaluator = RetrievalEvaluator(
-        corpus_embeds=corpus_embeds[:, layer_idx],   # [n_corpus, vocab_size]
-        query_embeds =query_embeds[:, layer_idx],    # [n_query,  vocab_size]
-        corpus_ids   =corpus_ds["Entry"],
-        query_ids    =query_ds["Entry"],
-        qrels        =qrels_dict,
-    )
-    scores = evaluator()
+        evaluator = RetrievalEvaluator(
+            corpus_embeds=corpus_embeds[:, 0],
+            query_embeds =query_embeds[:, 0],
+            corpus_ids   =corpus_ds["Entry"],
+            query_ids    =query_ds["Entry"],
+            qrels        =qrels_dict,
+        )
+        scores = evaluator()
 
-    # Primary metric is map_at_5
+    else:
+        # ── Sparse path: encode → cosine similarity → pytrec_eval ────────────
+        print("Encoding corpus (sparse)...")
+        corpus_sparse = encode_sparse(corpus_ds["Sequence"], k)  # [n_corpus, vocab]
+        print("Encoding queries (sparse)...")
+        query_sparse  = encode_sparse(query_ds["Sequence"],  k)  # [n_query,  vocab]
+
+        print("Computing cosine similarity matrix (sparse @ sparse.T)...")
+        # Both matrices are L2-normalized so dot product = cosine similarity.
+        # Result is [n_queries, n_corpus]; convert to dense for pytrec_eval.
+        sim = (query_sparse @ corpus_sparse.T)
+        if sparse.issparse(sim):
+            sim = sim.toarray()
+        sim = np.asarray(sim, dtype=np.float32)
+        print(f"  Similarity matrix shape: {sim.shape}, "
+              f"~{sim.nbytes / 1e6:.0f} MB")
+
+        print("Evaluating with pytrec_eval...")
+        scores = evaluate_with_pytrec(
+            sim_matrix =sim,
+            query_ids  =list(query_ds["Entry"]),
+            corpus_ids =list(corpus_ds["Entry"]),
+            qrels      =qrels_dict,
+        )
+
     map_at_5 = scores.get("map_at_5", float("nan"))
     print(f"  MAP@5 = {map_at_5:.5f}")
     return scores
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN: run all (k, task) combinations and collect results
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    k_values    = [1, 2, 3, 4]
-    task_ids    = ["arch_retrieval", "euk_retrieval"]
-    all_results = {}   # {task_id: {k: scores_dict}}
+    k_values  = [1, 2, 3, 4, 5]
+    task_ids  = ["arch_retrieval", "euk_retrieval"]
+    all_results = {}
 
     for task_id in task_ids:
         all_results[task_id] = {}
@@ -251,26 +333,32 @@ def main():
             output_path = os.path.join(output_dir, f"{task_id}.json")
             os.makedirs(output_dir, exist_ok=True)
 
+            # Skip if already cached
+            if os.path.exists(output_path):
+                print(f"[CACHED] k={k}, {task_id} — skipping.")
+                with open(output_path) as f:
+                    all_results[task_id][k] = json.load(f)
+                continue
+
             scores = run_kmer_retrieval(task_id, k)
             all_results[task_id][k] = scores
-
             with open(output_path, "w") as f:
                 json.dump(scores, f, indent=2)
             print(f"  Saved to {output_path}")
 
-    # ── Print final comparison table ─────────────────────────────────────────
-    print("\n" + "=" * 70)
+    # ── Summary table ─────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
     print("K-MER BASELINE RESULTS — MAP@5")
-    print("=" * 70)
-    print(f"{'Method':<20} {'Arch Retrieval':>18} {'Euk Retrieval':>18}")
-    print("-" * 58)
-
+    print("=" * 60)
+    print(f"{'Method':<15} {'Arch Retrieval':>16} {'Euk Retrieval':>16}")
+    print("-" * 50)
     for k in k_values:
-        arch = all_results["arch_retrieval"][k].get("map_at_5", float("nan"))
-        euk  = all_results["euk_retrieval"][k].get("map_at_5",  float("nan"))
-        print(f"{'k-mer k=' + str(k):<20} {arch:>18.5f} {euk:>18.5f}")
+        arch = all_results.get("arch_retrieval", {}).get(k, {}).get("map_at_5", float("nan"))
+        euk  = all_results.get("euk_retrieval",  {}).get(k, {}).get("map_at_5", float("nan"))
+        tag  = " [sparse]" if k > DENSE_K_MAX else ""
+        print(f"{'k=' + str(k):<15} {arch:>16.5f} {euk:>16.5f}{tag}")
 
-    # Save summary
+    # ── Save summary ──────────────────────────────────────────────────────────
     summary = {
         "kmer_results": {
             task_id: {str(k): v.get("map_at_5") for k, v in ks.items()}
@@ -279,7 +367,8 @@ def main():
     }
     with open("kmer_results_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
-    print("\nSummary saved to kmer_results_summary.json")
+    print("\nSaved kmer_results_summary.json")
+    print("Next: run step4_plot_results.py")
 
 
 if __name__ == "__main__":
